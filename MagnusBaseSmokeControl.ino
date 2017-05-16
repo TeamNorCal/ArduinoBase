@@ -3,6 +3,7 @@
 #include <string.h>
 #include "animation.hpp"
 #include "circbuff.hpp"
+
 // BASE ARDUINO
 //
 // this one cotrols the smoke, and the base LEDs
@@ -14,6 +15,7 @@
 // Test setups.. I had a spare NeoPixel ring (16 pixels) to use for testing
 // for that setup we use:  8 resos., 2 LEDs/reso and NEO_GRB pixels
 // for the final set up we will use 8 resonators, 12 LEDs per resonator and RGBW
+// or 1 string, with 8x12 resonators
 #define NUM_RESONATORS          1 //8
 #define NUM_LEDS_PER_RESONATOR  12 //2 //12
 const bool RGBW_SUPPORT = false;
@@ -45,10 +47,52 @@ int8_t  smoke2_flag = 0;
 uint16_t smoke1_timer;
 uint16_t smoke2_timer;
 
+bool SmokeActive(int counter, int percent)
+{
+  // smoke is active from t=0 until our counter goes over this scaled time
+  return counter > SMOKE_MINIMUM + ((SMOKE_MAXIMUM-SMOKE_MINIMUM) * percent / 100);
+}
+
 #define STRIP_TIME_COUNT  10 // ms
+const unsigned long LED_UPDATE_PERIOD = 5; // in ms. Time between drawing a frame on _any_ LED strip.
+
+//const long BAUD_RATE = 115200;
+const long BAUD_RATE = 9600;
+
+// Command format:
+// Fnnnnnnnnp12345678mmmm\n
+// F = faction: EeRrNn. Capitalized on state change; lowercase if same as before
+// n = resonator level
+// p = portal health percentage
+// 1-8 = resonator health percentage
+// m = mod status
+//
+// percentage health encoded as single character. Space (' ') is 0%, and then each ASCII character
+// above it is 2% greater, up to 'R' for 100%
+//
+// Mods:
+// ' ' - No mod present in this slot
+// '0' - FA Force Amp
+// '1' - HS-C Heat Shield, Common
+// '2' - HS-R Heat Shield, Rare
+// '3' - HS-VR Heat Shield, Very Rare
+// '4' - LA-R Link Amplifier, Rare
+// '5' - LA-VR Link Amplifier, Very Rare
+// '6' - SBUL SoftBank Ultra Link
+// '7' - MH-C MultiHack, Common
+// '8' - MH-R MultiHack, Rare
+// '9' - MH-VR MultiHack, Very Rare
+// 'A' - PS-C Portal Shield, Common
+// 'B' - PS-R Portal Shield, Rare
+// 'C' - PS-VR Portal Sheild, Very Rare
+// 'D' - AXA AXS Shield
+// 'E' - T Turret
+
+const unsigned int COMMAND_LENGTH = 22;
+const unsigned int PORTAL_STRENGTH_INDEX = 9;
 
 enum Direction { EAST = 0, NORTHEAST, NORTH, NORTHWEST, WEST, SOUTHWEST, SOUTH, SOUTHEAST };
-enum Ownership {  neutral = 0, enlightened, resistance };
+enum Ownership {  neutral = 0, enlightened, resistance, initial };
 
 // Static animation implementations singleton
 Animations animations;
@@ -71,41 +115,45 @@ Adafruit_NeoPixel strip = Adafruit_NeoPixel(LEDS_PER_STRAND, BASE_PIN, (RGBW_SUP
 
 
 // Serial I/O
-int8_t command[32];
+const int ioSize = 64;
+char command[32];
 int8_t in_index = 0;
+
+unsigned long nextUpdate;
 
 void start_serial(void)
 {
   in_index = 0;
-  Serial.begin(9600);
+  Serial.begin(BAUD_RATE);
 }
 
-bool collect_serial(void)
+enum SerialStatus { IDLE, IN_PROGRESS, COMMAND_COMPLETE };
+
+uint8_t collect_serial(void)
 {
-  while( Serial.available() > 0 )
-  {
-    int8_t ch = Serial.read();
-    if( ch == '\n' ) 
+    SerialStatus status = in_index == 0 ? IDLE : IN_PROGRESS;
+    int avail = Serial.available();
+    while (Serial.available() > 0)
     {
-      command[in_index] = 0; // terminate
-      if( in_index > 0 )
-      {
-        in_index = 0;
-        return true;
-      }
+        int8_t ch = Serial.read();
+        if ( ch == '\n' )
+        {
+            command[in_index] = 0; // terminate
+            if ( in_index > 0 )
+            {
+                in_index = 0;
+                return COMMAND_COMPLETE;
+            }
+        }
+        else if (ch != '\r') // ignore CR
+        {
+            command[in_index] = ch;
+            if ( in_index < (sizeof(command)/sizeof(command[0])) - 2 ) {
+                in_index++;
+            }
+        }
     }
-    else if( ch == 0x0a || ch == 0x13 ) // carriage return or linefeed (ignore
-    {
-    }
-    else
-    {
-      command[in_index] = ch;
-      in_index++;
-      //if( in_index >= 32 ) //sizeof(command) )
-      //  in_index = 0;
-    }
-  }
-  return false;
+    return status;
 }
 
 uint8_t getPercent(uint8_t *buffer)
@@ -114,6 +162,9 @@ uint8_t getPercent(uint8_t *buffer)
   return uint8_t( constrain(inVal, 0, 100) );
 }
 
+unsigned int decodePercent(const char encoded) {
+    return (encoded - ' ') * 2;
+}
 
 uint8_t dir;
 uint8_t percent;
@@ -136,7 +187,8 @@ void setup()
   }
 
   dir = EAST; // begin on the north resonator
-  owner = neutral;
+  //owner = neutral;
+  owner = initial;
   percent = 0;
   smoke1_flag = 0;
   smoke1_timer = 0;
@@ -148,96 +200,126 @@ void setup()
   digitalWrite(SMOKE2_PIN, SMOKE_OFF);
 
   last_millis = millis();
+  nextUpdate = last_millis;
   current_millis = last_millis;
-  smoke_millis = current_millis;
+  smoke_millis = last_millis;
 }
 
 // the loop function runs over and over again forever
 void loop() 
 {
   uint16_t i, val;
+  uint32_t now = millis();
 
-    if( collect_serial() )
+    SerialStatus status = collect_serial();
+    if (status == COMMAND_COMPLETE)
     {
         // we have valid buffer of serial input
         char cmd = command[0];
-//        if(strlen(cmd) == CONSTANT_LENGTH )
+        Ownership newOwner = owner;
         switch (cmd) {
-            Color c;
             case '*':
-                Serial.println("Magnus Core Node");  // Magnus Base Node
+                Serial.println("Magnus Core Node");
                 break;
             case 'E':
             case 'e':
             case 'R':
             case 'r':
-                owner = (cmd & CASE_MASK) == 'E' ? enlightened : resistance;
-                percent = getPercent(&command[1]);
-                uint8_t red, green, blue, white;
-                c = ToColor(0x00, 
-                        owner == enlightened ? 0xff : 0x00,
-                        owner == resistance ? 0xff : 0x00,
-                        0x00);
-                for (int i = 0; i < NUM_STRINGS; i++) {
-                    QueueType& animationQueue = animationQueues[i];
-                    animationQueue.setTo(&animations.pulse);
-                    unsigned int stateIdx = animationQueue.lastIdx();
-                    double initialPhase = ((double) i) / NUM_STRINGS;
-                    animations.pulse.init(states[i][stateIdx], strip, c, initialPhase);
+                int len;
+                len = strlen(command);
+                if (len != COMMAND_LENGTH) {
+                    Serial.print("Invalid length of command \"");Serial.print(command);Serial.print("\": ");Serial.println(len, DEC);
+                    break;
                 }
+                newOwner = (cmd & CASE_MASK) == 'E' ? enlightened : resistance;
+                char strength;
+                strength = command[PORTAL_STRENGTH_INDEX];
+                percent = decodePercent(strength);
+                //Serial.print("Owner ");Serial.print(newOwner, DEC);Serial.print(" pct ");Serial.println(percent, DEC);
                 break;
 
             case 'N':
             case 'n':
-                owner = neutral;
-                percent = 20;
-                if (RGBW_SUPPORT) {
-                    c = ToColor(0x00, 0x00, 0x00, 0xff);
-                } else {
-                    c = ToColor(0xff, 0xff, 0xff);
-                }
-                for (int i = 0; i < NUM_STRINGS; i++) {
-                    QueueType& animationQueue = animationQueues[i];
-                    animationQueue.setTo(&animations.redFlash);
-                    unsigned int stateIdx = animationQueue.lastIdx();
-                    animations.redFlash.init(states[i][stateIdx], strip, RGBW_SUPPORT);
-                    animationQueue.add(&animations.solid);
-                    stateIdx = animationQueue.lastIdx();
-                    animations.solid.init(states[i][stateIdx], strip, c);
-                }
+                newOwner = neutral;
+                //Serial.println("Neutral");
                 break;
 
             default:
                 Serial.print("Unkwown command "); Serial.println(cmd);
                 break;
         }
-        Serial.print((char *)command); Serial.print(" - ");Serial.print(command[0],DEC);Serial.print(": "); 
-        Serial.print("owner "); Serial.print(owner,DEC); Serial.print(", percent "); Serial.println(percent,DEC); 
+
+        // Check for ownership change
+        if (newOwner != owner) {
+            owner = newOwner;
+            Color c;
+            switch (owner) {
+                case enlightened:
+                case resistance:
+                    uint8_t red, green, blue, white;
+                    c = ToColor(0x00, 
+                            owner == enlightened ? 0xff : 0x00,
+                            owner == resistance ? 0xff : 0x00,
+                            0x00);
+                    for (int i = 0; i < NUM_STRINGS; i++) {
+                        QueueType& animationQueue = animationQueues[i];
+                        animationQueue.setTo(&animations.pulse);
+                        unsigned int stateIdx = animationQueue.lastIdx();
+                        double initialPhase = ((double) i) / NUM_STRINGS;
+                        animations.pulse.init(now, states[i][stateIdx], strip, c, initialPhase);
+                    }
+                    break;
+
+                case neutral:
+                    percent = 20;
+                    if (RGBW_SUPPORT) {
+                        c = ToColor(0x00, 0x00, 0x00, 0xff);
+                    } else {
+                        c = ToColor(0xff, 0xff, 0xff);
+                    }
+                    for (int i = 0; i < NUM_STRINGS; i++) {
+                        QueueType& animationQueue = animationQueues[i];
+                        animationQueue.setTo(&animations.redFlash);
+                        unsigned int stateIdx = animationQueue.lastIdx();
+                        animations.redFlash.init(now, states[i][stateIdx], strip, RGBW_SUPPORT);
+                        animationQueue.add(&animations.solid);
+                        stateIdx = animationQueue.lastIdx();
+                        animations.solid.init(now, states[i][stateIdx], strip, c);
+                    }
+                    break;
+
+                default:
+                    Serial.print("Invalid owner "); Serial.println(owner);
+                    break;
+            }
+//        Serial.print((char *)command); Serial.print(" - ");Serial.print(command[0],DEC);Serial.print(": "); 
+//        Serial.print("owner "); Serial.print(owner,DEC); Serial.print(", percent "); Serial.println(percent,DEC); 
+        }
     }
 
-  current_millis = millis();
-  if(current_millis > last_millis + STRIP_TIME_COUNT )
+  if(now > last_millis + STRIP_TIME_COUNT )
   {
-    last_millis = current_millis; // every X milliseconds we will check this direction
+    last_millis = now; // every X milliseconds we will check this direction
     
     strip.setPin(dir+BASE_PIN);  // pick the string
 //    strip.setPin(BASE_PIN);  // pick the string
 
-    QueueType& animationQueue = animationQueues[dir];
-    unsigned int queueSize = animationQueue.size();
-    if (queueSize > 1) {
-        if (animationQueue.peek()->done(states[dir][animationQueue.currIdx()])) {
-            animationQueue.remove();
-            queueSize--;
-            animationQueue.peek()->start(states[dir][animationQueue.currIdx()]);
+        QueueType& animationQueue = animationQueues[dir];
+        unsigned int queueSize = animationQueue.size();
+        if (queueSize > 1) {
+            if (animationQueue.peek()->done(now, states[dir][animationQueue.currIdx()])) {
+                animationQueue.remove();
+                queueSize--;
+                animationQueue.peek()->start(now, states[dir][animationQueue.currIdx()]);
+            }
         }
-    }
-    if (queueSize > 0) {
-        //strip.setBrightness(255);
-        strip.setBrightness((uint8_t)((uint16_t)(255*(percent/100.0))));
-        //pCurrAnimation->doFrame(states[0], strip);
-        animationQueue.peek()->doFrame(states[dir][animationQueue.currIdx()], strip);
-    }
+        if (queueSize > 0) {
+            //strip.setBrightness(255);
+            strip.setBrightness((uint8_t)((uint16_t)(255*(percent/100.0))));
+            //pCurrAnimation->doFrame(states[0], strip);
+            animationQueue.peek()->doFrame(now, states[dir][animationQueue.currIdx()], strip);
+        }
+
 
     // Update one strand each time through the loop
     dir = (dir + 1) % NUM_STRINGS;
@@ -245,11 +327,11 @@ void loop()
 
 
   // smoke on/off
-  if( current_millis != smoke_millis )
+  if( now != smoke_millis )
   {
-    smoke_millis = current_millis;
+    smoke_millis = now;
 
-    if( ++smoke1_timer > SMOKE_MINIMUM )
+    if( SmokeActive(++smoke1_timer, percent) )
     {
       if( smoke1_flag )
       {
@@ -265,7 +347,7 @@ void loop()
         smoke1_flag = 1;
       }
     }
-    if( ++smoke2_timer > SMOKE_MINIMUM )
+    if( SmokeActive(++smoke2_timer, percent) )
     {
       if( smoke2_flag )
       {
