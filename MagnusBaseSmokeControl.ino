@@ -219,7 +219,7 @@ void loop()
         Ownership newOwner = owner;
         switch (cmd) {
             case '*':
-                Serial.println("Magnus Core Node");
+                Serial.println("Magnus Base Node");
                 break;
             case 'E':
             case 'e':
@@ -241,11 +241,12 @@ void loop()
             case 'N':
             case 'n':
                 newOwner = neutral;
+                percent = 0; // always
                 //Serial.println("Neutral");
                 break;
 
             default:
-                Serial.print("Unkwown command "); Serial.println(cmd);
+                Serial.print("Unknown command "); Serial.println(cmd);
                 break;
         }
 
