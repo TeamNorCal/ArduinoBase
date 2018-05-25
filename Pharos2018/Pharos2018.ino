@@ -14,18 +14,20 @@
 
 // smoke on the water, fire in the sky
 
+uint8_t color_counter;
+
 #define SMOKE1_PIN  12
 #define SMOKE2_PIN  11
 #define AIRHORN_PIN 10
 #define ONBOARD_LED 13
 
-#define SMOKE_CYCLE   10000 // 10 second cycles
+#define SMOKE_CYCLE   24000 // 10 second cycles
 
 #define SMOKE1_START   1000 // 1 second
-#define SMOKE1_END     4000  // 4 second
+#define SMOKE1_END     3000  // 4 second
 
-#define SMOKE2_START   6000  // 6 second
-#define SMOKE2_END     9000  // 9 second
+#define SMOKE2_START   13000  // 6 second
+#define SMOKE2_END     15000  // 9 second
 
 #define AIRHORN_CYCLE (5 * 60000) // 5 minute cycles
 #define AIRHORN_START 10000 // 5 second
@@ -34,9 +36,9 @@
 unsigned long smoke_timer;
 unsigned long airhorn_timer;
 
-#define PIN 2
+#define PIN 6
 
-Adafruit_NeoPixel strip = Adafruit_NeoPixel(173, PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(173, PIN, NEO_RGBW + NEO_KHZ800);
 // PHAROS sign has 173 LEDs
 
 void setup() {
@@ -57,13 +59,13 @@ void loop()
   airhorn_timer = millis() % AIRHORN_CYCLE; 
 
 //  digitalWrite(AIRHORN_LED, (airhorn_timer < 5000);
-  if (((airhorn_timer) % 1000) == 0) {
+  //if (((airhorn_timer) % 1000) == 0) {
     // Serial.println(airhorn_timer);
-  }
-  digitalWrite(ONBOARD_LED, (airhorn_timer > AIRHORN_START) and (airhorn_timer < AIRHORN_END));  // use for lighting onboard LED
-  digitalWrite(AIRHORN_PIN, (airhorn_timer > AIRHORN_START) and (airhorn_timer < AIRHORN_END));
-  digitalWrite(SMOKE1_PIN, (smoke_timer > SMOKE1_START) and (smoke_timer < SMOKE1_END));
-  digitalWrite(SMOKE2_PIN, (smoke_timer > SMOKE2_START) and (smoke_timer < SMOKE2_END));
+  //}
+  digitalWrite(ONBOARD_LED, (airhorn_timer < AIRHORN_START) or (airhorn_timer > AIRHORN_END));  // use for lighting onboard LED
+  digitalWrite(AIRHORN_PIN, (airhorn_timer < AIRHORN_START) or (airhorn_timer > AIRHORN_END));
+  digitalWrite(SMOKE1_PIN, (smoke_timer < SMOKE1_START) or (smoke_timer > SMOKE1_END));
+  digitalWrite(SMOKE2_PIN, (smoke_timer < SMOKE2_START) or (smoke_timer > SMOKE2_END));
   
 // Neopixel animationloop code
 
@@ -77,7 +79,10 @@ void loop()
 //  theaterChase(strip.Color(127, 0, 0), 50); // Red
 //  theaterChase(strip.Color(0, 0, 127), 50); // Blue
 //  rainbow_window(5);
- // rainbowCycle(20);    <====== this one
+if (airhorn_timer % 1000 == 0) {
+  rainbow(color_counter % 256);  //    <====== this one
+  color_counter++;
+}
 //  theaterChaseRainbow(50);
 }
 
@@ -92,10 +97,9 @@ void colorWipe(uint32_t c, uint8_t wait) {
   }
 }
 
-void rainbow(uint8_t wait) {
-  uint16_t i, j, k;
+void rainbow(uint8_t j) {
+  uint16_t i, k;
 
-  j = (millis() / 5000) % 256; // change colors every 5 seconds or so?
   for(i=0; i<strip.numPixels(); i++) {
     // strip.setPixelColor(i, Wheel((i+j) & 255));
     for(k=0; k<25; k++) {    //25
@@ -152,10 +156,9 @@ void rainbow_old(uint8_t wait) {
   }
 }
 
-void rainbow_window(uint8_t wait) {
-  uint16_t i, j, k;
+void rainbow_window(uint8_t j) {
+  uint16_t i, k;
 
-  for(j=0; j<256; j++) {
     for(i=0; i<strip.numPixels(); i++) {
       // strip.setPixelColor(i, Wheel((i+j) & 255));
       for(k=0; k<4; k++) {    //25
@@ -178,8 +181,6 @@ void rainbow_window(uint8_t wait) {
       }
     }
     strip.show();
-    delay(wait);
-  }
 }
 
 
